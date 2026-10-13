@@ -1,0 +1,9 @@
+workspace/settings.json
+workspace/projects.json
+workspace/exports/
+workspace/assets/
+node_modules/
+.DS_Store
+.env
+.env.*
+!.env.example
