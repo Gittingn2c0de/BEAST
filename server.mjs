@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import { spawn } from 'node:child_process';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -16,6 +16,113 @@ const PORT = Number(process.env.PORT || 3000);
 const HOST = '0.0.0.0';
 const MODEL = 'mercury-2.5';
 const BASE_URL = 'https://api.inceptionlabs.ai/v1';
+// Single-user authentication. In production, both values must come from Azure secrets.
+const ACCESS_PASSWORD = process.env.BEAST_ACCESS_PASSWORD || '';
+const SESSION_SECRET = process.env.BEAST_SESSION_SECRET || '';
+const AUTH_ENABLED = Boolean(ACCESS_PASSWORD && SESSION_SECRET);
+const SESSION_SECONDS = 8 * 60 * 60;
+const LOGIN_ATTEMPTS = new Map();
+
+if (process.env.NODE_ENV === 'production' && !AUTH_ENABLED) {
+  throw new Error('BEAST_ACCESS_PASSWORD and BEAST_SESSION_SECRET must be configured in production.');
+}
+
+function signSession(expiry) {
+  return createHmac('sha256', SESSION_SECRET).update(String(expiry)).digest('hex');
+}
+
+function validSession(req) {
+  if (!AUTH_ENABLED) return process.env.NODE_ENV !== 'production';
+
+  const cookies = Object.fromEntries(
+    (req.headers.cookie || '').split(';').map(part => {
+      const i = part.indexOf('=');
+      return i < 0 ? ['', ''] : [part.slice(0, i).trim(), part.slice(i + 1).trim()];
+    })
+  );
+
+  const token = cookies.beast_session || '';
+  const parts = token.split('.');
+  if (parts.length !== 2) return false;
+
+  const [expiryText, signature] = parts;
+  const expiry = Number(expiryText);
+  if (!Number.isSafeInteger(expiry) || expiry <= Math.floor(Date.now() / 1000)) return false;
+
+  const expected = signSession(expiry);
+  const suppliedBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+
+  return suppliedBuffer.length === expectedBuffer.length &&
+    timingSafeEqual(suppliedBuffer, expectedBuffer);
+}
+
+function loginPage() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BEAST · Sign in</title>
+<style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10141b;color:#f3eee5;font:16px system-ui,sans-serif}
+main{width:min(390px,calc(100% - 36px));padding:36px;background:#1b222c;border:1px solid #394451;border-radius:14px}
+h1{letter-spacing:.16em;font-size:25px;margin:0 0 8px}p{color:#aeb8c3;margin:0 0 26px}
+label{display:block;margin-bottom:8px;font-size:13px;color:#cbd3dc}
+input,button{width:100%;padding:13px;border-radius:7px;font:inherit}
+input{background:#101720;border:1px solid #526071;color:white;margin-bottom:15px}
+button{border:0;background:#e8b65c;color:#171717;font-weight:700;cursor:pointer}
+#error{color:#ff9d91;min-height:22px;margin-top:14px;font-size:13px}
+</style>
+</head>
+<body>
+<main>
+<h1>BEAST</h1>
+<p>Creative Studio · Private access</p>
+<form id="login">
+<label for="password">Access password</label>
+<input id="password" type="password" autocomplete="current-password" required autofocus>
+<button type="submit">Enter BEAST</button>
+<div id="error" role="alert"></div>
+</form>
+</main>
+<script>
+document.getElementById('login').addEventListener('submit', async event => {
+  event.preventDefault();
+  const error = document.getElementById('error');
+  const button = event.target.querySelector('button');
+  button.disabled = true;
+  error.textContent = 'Signing in…';
+  try {
+    const response = await fetch('/auth/login', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({password:document.getElementById('password').value})
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Sign-in failed.');
+    location.assign('/');
+  } catch (e) {
+    error.textContent = e.message;
+    button.disabled = false;
+  }
+});
+</script>
+</body>
+</html>`;
+}
+
+function sendLoginPage(res) {
+  const html = loginPage();
+  res.writeHead(200, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Content-Length': Buffer.byteLength(html),
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer'
+  });
+  res.end(html);
+}
 fs.mkdirSync(WORKSPACE, { recursive: true });
 for (const d of ['exports', 'assets']) fs.mkdirSync(path.join(WORKSPACE, d), { recursive: true });
 
@@ -160,7 +267,91 @@ function localStoryboardSvg(prompt, shotIndex, look = 'expressionist cinematic i
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
   const pathname = decodeURIComponent(url.pathname);
-  if (req.method === 'GET' && pathname === '/api/health') { const st=settings(); return json(res, 200, { status: 'ok', app: 'BEAST Creative Studio', version: '1.2.0', provider: 'Inception Labs', model: MODEL, apiKeyConfigured: Boolean(st.apiKey), imageBackend: st.imageBackend || 'remote-worker', imageWorkerConfigured: Boolean(st.imageWorkerUrl), projects: projects().length, vectorCanvas: true, stillFirstFilmBuilder: true, backgroundJobs: true, videoGeneration: 'not-connected', brains: ['beast','chappy','canvas'], genjustsu: 'adapter-spec-only' }); }
+    // Login is the only application route available without an authenticated session.
+  if (req.method === 'POST' && pathname === '/auth/login') {
+    try {
+      if (!AUTH_ENABLED) return json(res, 503, { error: 'Authentication is not configured.' });
+
+      const ip = req.socket.remoteAddress || 'unknown';
+      const now = Date.now();
+      const attempt = LOGIN_ATTEMPTS.get(ip) || { count: 0, since: now };
+
+      if (now - attempt.since > 15 * 60 * 1000) {
+        attempt.count = 0;
+        attempt.since = now;
+      }
+
+      if (attempt.count >= 10) {
+        return json(res, 429, { error: 'Too many sign-in attempts. Wait 15 minutes and try again.' });
+      }
+
+      const body = await readBody(req, 5000);
+      const supplied = Buffer.from(String(body.password || ''));
+      const expected = Buffer.from(ACCESS_PASSWORD);
+      const matches = supplied.length === expected.length &&
+        timingSafeEqual(supplied, expected);
+
+      if (!matches) {
+        attempt.count++;
+        LOGIN_ATTEMPTS.set(ip, attempt);
+        return json(res, 401, { error: 'Incorrect password.' });
+      }
+
+      LOGIN_ATTEMPTS.delete(ip);
+
+      const expiry = Math.floor(Date.now() / 1000) + SESSION_SECONDS;
+      const token = `${expiry}.${signSession(expiry)}`;
+      const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+
+      res.setHeader('Set-Cookie',
+        `beast_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_SECONDS}${secure}`
+      );
+
+      return json(res, 200, { ok: true });
+    } catch (e) {
+      return json(res, 400, { error: e.message || 'Sign-in failed.' });
+    }
+  }
+
+ if (req.method === 'POST' && pathname === '/auth/logout') {
+  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  res.setHeader('Set-Cookie',
+    `beast_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure}`
+  );
+  return json(res, 200, { ok: true });
+}
+
+  // Everything else, including every API endpoint and static asset, requires login.
+  if (!validSession(req)) {
+    if (pathname.startsWith('/api/')) {
+      return json(res, 401, { error: 'Authentication required. Sign in to BEAST.' });
+    }
+    if (req.method === 'GET' || req.method === 'HEAD') {
+      return sendLoginPage(res);
+    }
+    return json(res, 401, { error: 'Authentication required.' });
+  }
+
+  if (req.method === 'GET' && pathname === '/api/health') {
+    const st = settings();
+    return json(res, 200, {
+      status: 'ok',
+      app: 'BEAST Creative Studio',
+      version: '1.3.1',
+      provider: 'Inception Labs',
+      model: MODEL,
+      apiKeyConfigured: Boolean(st.apiKey),
+      imageBackend: st.imageBackend || 'remote-worker',
+      imageWorkerConfigured: Boolean(st.imageWorkerUrl),
+      projects: projects().length,
+      vectorCanvas: true,
+      stillFirstFilmBuilder: true,
+      backgroundJobs: true,
+      videoGeneration: 'not-connected',
+      brains: ['beast', 'chappy', 'canvas'],
+      genjustsu: 'adapter-spec-only'
+    });
+  }
   if (req.method === 'GET' && pathname === '/api/brains') return json(res, 200, { brains: [{ id: 'beast', name: 'BEAST', role: 'Creative director, story, visual design, production planning and QA', provider: 'Inception Labs Mercury 2.5', status: 'active' }, { id: 'chappy', name: 'Chappy / Supermusician', role: 'Composition, music production, sound design, track analysis and sonic identity', provider: 'Inception Labs Mercury 2.5 with specialist profile', status: CHAPPY_TEXT ? 'active-profile-only' : 'unavailable' }, { id: 'research', name: 'Research agent', role: 'Future source-backed web research and rights-aware asset discovery', status: 'planned-not-connected' }, { id: 'genjustsu', name: 'Genjustsu adapter', role: 'Future specialist subject/object replacement video workflow', status: 'adapter-spec-only' }, { id: 'framecraft', name: 'Framecraft animation', role: 'Future still-image / keyframe-to-motion pipeline', status: 'planned-not-connected' }] });
   if (req.method === 'GET' && pathname === '/api/settings') return json(res, 200, { apiKeyConfigured: Boolean(settings().apiKey), model: MODEL, baseUrl: BASE_URL });
   if (req.method === 'GET' && pathname === '/api/production/story-source') { const f=path.join(KNOWLEDGE,'story_sources','the-vacant-throne.md'); return json(res,200,{story:fs.existsSync(f)?fs.readFileSync(f,'utf8'):''}); }
@@ -430,7 +621,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   const address = `http://${HOST}:${PORT}`;
-  console.log(`\n  BEAST CREATIVE STUDIO 1.3.0\n  Local workspace: ${address}\n  AI brains: BEAST + Chappy / Inception Labs ${MODEL}\n  Data stays in: ${WORKSPACE}\n  Press Ctrl+C to stop.\n`);
+  console.log(`\n  BEAST CREATIVE STUDIO 1.3.1\n  Local workspace: ${address}\n  AI brains: BEAST + Chappy / Inception Labs ${MODEL}\n  Data stays in: ${WORKSPACE}\n  Press Ctrl+C to stop.\n`);
   if (process.env.BEAST_NO_OPEN !== '1') {
     const command = process.platform === 'win32' ? 'cmd' : process.platform === 'darwin' ? 'open' : 'xdg-open';
     const args = process.platform === 'win32' ? ['/c','start','',address] : [address];
