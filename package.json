@@ -1,6 +1,6 @@
 {
   "name": "beast-creative-studio",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "private": true,
   "description": "BEAST creative studio with offline shot-graph planning, local vector storyboard rendering, prompt diagnostics, CANVAS and film assembly",
   "scripts": {
