@@ -1,3 +1,6 @@
+UHHHH Don't Peak the porject is a mess, check the repo in March 2027.
+
+
 # BEAST Creative Studio v1.1.0
 
 Local-first creative studio for story development and still-first film production. Windows launch remains `npm run dv`.
