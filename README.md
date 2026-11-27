@@ -1,4 +1,4 @@
-UHHHH Don't Peak the porject is a mess, check the repo in March 2027.
+UHHHH Don't snoop the project is a mess, check the repo in March 2027. Using significantly inferior intelligence to build this btw.
 
 
 # BEAST Creative Studio v1.1.0
